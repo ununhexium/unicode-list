@@ -3,13 +3,240 @@
  */
 package dev.c15u
 
-class App {
-    val greeting: String
-        get() {
-            return "Hello World!"
+import com.gitlab.mvysny.konsumexml.Konsumer
+import com.gitlab.mvysny.konsumexml.anyName
+import com.gitlab.mvysny.konsumexml.konsumeXml
+import java.io.ByteArrayInputStream
+import java.net.URI
+import java.nio.file.Files
+import java.nio.file.Path
+import java.nio.file.Paths
+import java.util.zip.ZipInputStream
+
+data class Ucd(val repertoire: Repertoire) {
+  companion object {
+    fun xml(k: Konsumer): Ucd {
+      return k.child("ucd") {
+        child("description") {
+          skipContents()
         }
+        val ucd = Ucd(
+          child("repertoire") {
+            Repertoire.xml(this)
+          }
+        )
+        child("blocks") {
+          skipContents()
+        }
+        child("named-sequences") {
+          skipContents()
+        }
+        child("normalization-corrections") {
+          skipContents()
+        }
+        child("standardized-variants") {
+          skipContents()
+        }
+        child("cjk-radicals") {
+          skipContents()
+        }
+        child("emoji-sources") {
+          skipContents()
+        }
+
+        ucd
+      }
+    }
+  }
 }
 
+data class Repertoire(val characters: List<Ch>) {
+  companion object {
+    fun xml(k: Konsumer): Repertoire {
+      k.checkCurrent("repertoire")
+      val chars = mutableListOf<Ch>()
+      chars.addAll(
+        k.children(anyName) {
+          when (localName) {
+            "char" -> Ch.xml(this)
+            else -> {
+//              println("Skipping: $localName @$location")
+              null
+            }
+          }
+        }.filterNotNull()
+      )
+      return Repertoire(chars)
+    }
+  }
+}
+
+data class Ch(
+  val cp: Int,
+  val blk: String,
+  val emoji: Boolean,
+  val names:List<String>,
+) {
+  companion object {
+    fun xml(k: Konsumer): Ch? {
+      k.checkCurrent("char")
+      return if (k.attributes.getValueOrNull("first-cp") != null) {
+        null
+      } else {
+
+        val na = k.attributes["na"]
+        val na1 = k.attributes["na1"]
+        val kMandarin = k.attributes.getValueOrNull("kMandarin")
+//        val nameAlias = k.children("name-alias") { NameAlias.xml(this) }
+
+        val candidates = listOf(na) + listOf(na1) + listOf(kMandarin)
+
+        val names = candidates
+          .filterNotNull()
+          .filter { it.trim().isNotEmpty() }
+
+        val ch = Ch(
+          cp = k.attributes["cp"].toInt(16),
+          blk = k.attributes["blk"],
+          emoji = when (val emoji = k.attributes.getValueOrNull("emoji")) {
+            "N" -> false
+            null -> false
+            else -> error("Don't know how to convert $emoji")
+          },
+          names
+        )
+        
+        k.children("name-alias") {
+          skipContents()
+        }
+
+        ch
+      }
+    }
+  }
+}
+
+data class NameAlias(val alias: String, val type: String) {
+  companion object {
+    fun xml(k: Konsumer): NameAlias {
+      k.checkCurrent("name-alias")
+      val alias = k.attributes["alias"]
+      return NameAlias(
+        alias,
+        k.attributes["type"],
+      )
+    }
+  }
+}
+
+
 fun main() {
-    println(App().greeting)
+  val zipLocation = Paths.get("/tmp/unicode.zip")
+  if (!Files.exists(zipLocation)) {
+    val zip = downloadData()
+    Files.write(zipLocation, zip)
+  }
+
+  val xmlLocation = Paths.get("/tmp/unicode.xml")
+  if (!Files.exists(xmlLocation)) {
+    val tmp = unzip(Files.readAllBytes(zipLocation))
+    Files.write(xmlLocation, tmp)
+  }
+
+  val xml = String(Files.readAllBytes(xmlLocation))
+
+//  println(xml.take(10_000))
+
+  val parsed = xml.konsumeXml().let {
+    Ucd.xml(it)
+  }
+
+  val filtered = selectBlocks(parsed)
+
+  println("Found ${filtered.size} chars")
+  val blocks = filtered.groupingBy { it.blk }.eachCount()
+  println("Found ${blocks.size} blocks")
+
+  printBlocks(filtered)
+
+//  printAllChars(filtered)
+
+  output(Paths.get("/tmp/list.txt"), filtered)
+}
+
+fun output(path: Path, filtered: List<Ch>) {
+  val out = filtered.filter { it.names.isNotEmpty() }.joinToString("\n") { c ->
+    Character.toString(c.cp) + " " + c.names.first()
+  }
+
+  Files.write(path, out.toByteArray(Charsets.UTF_8))
+}
+
+private fun selectBlocks(parsed: Ucd): List<Ch> {
+  val bannedBlocks = listOf(
+    "Tags", "VS_Sup", "CJK_Ext_E", "CJK_Ext_F", "CJK_Ext_G", "CJK_Compat_Ideographs_Sup"
+  )
+  val filtered = parsed.repertoire.characters.filter {
+    it.blk in listOf(
+      "Latin_Ext_A",
+      "Latin_Ext_B",
+      "Latin_Ext_C",
+      "Latin_Ext_D",
+      "Latin_Ext_E",
+      "Greek",
+      "Currency_Symbols",
+      "Arrows",
+      "Math_Operators",
+      "Enclosed_Alphanum",
+      "Box_Drawing",
+      "Geometric_Shapes",
+      "Misc_Symbols",
+      "Misc_Math_Symbols_A",
+      "Misc_Math_Symbols_B",
+      "Misc_Arrows",
+      "CJK_Radicals_Sup",
+      "CJK_Symbols",
+      "Hiragana",
+      "Katakana",
+      "CJK_Strokes",
+      "Katakana_Ext",
+      "Enclosed_CJK",
+      "CJK_Compat",
+      "CJK_Ext_A",
+      "CJK",
+      "Alchemical",
+      "Emoticons",
+    )
+  }
+  return filtered
+}
+
+private fun printBlocks(filtered: List<Ch>) {
+  println()
+  println("First char of each block:")
+  filtered.groupBy { it.blk }.map { it.key to it.value.minByOrNull { it.cp } }.forEach {
+    println(it.first + " -> " + (it.second?.names?.firstOrNull() ?: ""))
+  }
+}
+
+private fun printAllChars(filtered: List<Ch>) {
+  println()
+  println("All chars")
+  filtered.forEach {
+    println(Character.toString(it.cp) + " @ " + it.cp.toString(16) + " : " + it.names.joinToString(", ") { it } + " -> " + it)
+    println()
+  }
+}
+
+fun downloadData(): ByteArray {
+  val source = "https://www.unicode.org/Public/14.0.0/ucdxml/ucd.all.flat.zip"
+
+  return URI(source).toURL().openStream().readAllBytes() ?: error("Can't download $source")
+}
+
+fun unzip(zip: ByteArray): ByteArray {
+  ZipInputStream(ByteArrayInputStream(zip)).use { zis ->
+    zis.nextEntry ?: error("No file at the root of the zip")
+    return zis.readAllBytes()
+  }
 }
